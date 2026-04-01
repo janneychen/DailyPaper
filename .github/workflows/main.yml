@@ -1,0 +1,395 @@
+name: Daily Paper Tracker (Test Mode)
+
+on:
+  schedule:
+    # 每天 UTC 时间 00:00 运行 (北京时间早上8点)
+    - cron: '0 0 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  run-paper-tracker:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests beautifulsoup4 lxml
+        
+    - name: Create config directory
+      run: mkdir -p config
+      
+    - name: Create seed papers files if not exists
+      run: |
+        # 创建正向种子论文文件（如果不存在）
+        if [ ! -f config/seed_paper_positive.csv ]; then
+          echo "arXiv:2301.00001" > config/seed_paper_positive.csv
+          echo "arXiv:2301.00002" >> config/seed_paper_positive.csv
+          echo "# Add your positive seed paper IDs here (one per line)" >> config/seed_paper_positive.csv
+          echo "# 可以使用 arXiv ID (如: arXiv:2301.00001) 或 Semantic Scholar ID" >> config/seed_paper_positive.csv
+        fi
+        
+        # 创建负向种子论文文件（如果不存在）
+        if [ ! -f config/seed_paper_negative.csv ]; then
+          touch config/seed_paper_negative.csv
+          echo "# Add your negative seed paper IDs here (one per line, optional)" >> config/seed_paper_negative.csv
+        fi
+        
+        # 创建历史记录文件（如果不存在）
+        if [ ! -f config/seen_papers.txt ]; then
+          touch config/seen_papers.txt
+        fi
+        
+    - name: Create test version of paper tracker (No API Keys Required)
+      run: |
+        cat > paper_tracker_test.py << 'EOF'
+import os
+import requests
+from datetime import datetime, timedelta
+import re
+
+# --- 配置区 ---
+HISTORY_FILE = "config/seen_papers.txt"
+
+def read_list(file_path):
+    """读取文件列表，忽略空行"""
+    if not os.path.exists(file_path):
+        return []
+    with open(file_path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+
+def read_seed_papers(file_path):
+    """从本地读取论文 ID 列表"""
+    papers = []
+    if not os.path.exists(file_path):
+        print(f"Warning: 找不到文件 {file_path}")
+        return papers
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                papers.append(line)
+    return papers
+
+def extract_paper_id_from_arxiv(url_or_id):
+    """从arXiv URL或ID中提取标准arXiv ID"""
+    # 匹配 arXiv:YYMM.NNNN 格式
+    arxiv_pattern = r'(?:arXiv:)?(\d{4}\.\d{4,5}(?:v\d+)?)'
+    match = re.search(arxiv_pattern, url_or_id)
+    if match:
+        return f"arXiv:{match.group(1)}"
+    return url_or_id
+
+def search_arxiv_papers(query="machine learning", max_results=10):
+    """使用arXiv API搜索论文（免费，无需API Key）"""
+    print(f"正在通过arXiv API搜索: {query}")
+    
+    # arXiv API URL
+    base_url = "http://export.arxiv.org/api/query"
+    
+    # 构建查询参数
+    params = {
+        "search_query": f"all:{query}",
+        "start": 0,
+        "max_results": max_results,
+        "sortBy": "submittedDate",
+        "sortOrder": "descending"
+    }
+    
+    try:
+        response = requests.get(base_url, params=params, timeout=30)
+        response.raise_for_status()
+        
+        # 简单的XML解析（提取基本信息）
+        papers = []
+        entries = re.findall(r'<entry>(.*?)</entry>', response.text, re.DOTALL)
+        
+        for entry in entries:
+            # 提取标题
+            title_match = re.search(r'<title>(.*?)</title>', entry, re.DOTALL)
+            title = re.sub(r'\s+', ' ', title_match.group(1)).strip() if title_match else "无标题"
+            
+            # 提取摘要
+            summary_match = re.search(r'<summary>(.*?)</summary>', entry, re.DOTALL)
+            abstract = re.sub(r'\s+', ' ', summary_match.group(1)).strip() if summary_match else "无摘要"
+            
+            # 提取发布日期
+            published_match = re.search(r'<published>(.*?)</published>', entry)
+            published = published_match.group(1) if published_match else "未知日期"
+            
+            # 提取作者
+            authors = []
+            author_matches = re.findall(r'<name>(.*?)</name>', entry)
+            authors = [name.strip() for name in author_matches]
+            
+            # 提取ArXiv ID
+            id_match = re.search(r'<id>(.*?)</id>', entry)
+            arxiv_url = id_match.group(1) if id_match else ""
+            paper_id = extract_paper_id_from_arxiv(arxiv_url)
+            
+            # 构建论文信息
+            paper_info = {
+                "paperId": paper_id,
+                "title": title,
+                "abstract": abstract,
+                "authors": [{"name": author} for author in authors],
+                "url": arxiv_url,
+                "venue": "arXiv",
+                "publicationDate": published.split('T')[0] if 'T' in published else published,
+                "year": published[:4] if published.isdigit() or len(published) >= 4 else "未知",
+                "tldrText": ""  # arXiv没有TLDR，留空
+            }
+            
+            papers.append(paper_info)
+        
+        print(f"成功获取到 {len(papers)} 篇arXiv论文")
+        return papers
+        
+    except Exception as e:
+        print(f"arXiv API请求失败: {e}")
+        return []
+
+def get_paper_recommendations():
+    """模拟推荐系统 - 使用arXiv API获取最新论文"""
+    print("=== 开始获取论文推荐 ===")
+    
+    # 读取种子论文（仅用于演示，实际不使用）
+    positive_papers = read_seed_papers("config/seed_paper_positive.csv")
+    negative_papers = read_seed_papers("config/seed_paper_negative.csv")
+    
+    print(f"载入正向论文: {len(positive_papers)} 篇")
+    print(f"载入负向论文: {len(negative_papers)} 篇")
+    
+    if not positive_papers:
+        print("使用默认关键词进行搜索")
+        # 如果没有种子论文，使用默认关键词
+        query = "artificial intelligence OR machine learning OR deep learning"
+    else:
+        # 使用第一个种子论文的关键词（简化处理）
+        query = "machine learning"  # 可以根据需要扩展为更复杂的逻辑
+    
+    # 获取最新论文
+    raw_papers = search_arxiv_papers(query=query, max_results=15)
+    
+    if not raw_papers:
+        print("未能获取到任何论文")
+        return []
+    
+    seen_papers = set(read_list(HISTORY_FILE))
+    
+    # 过滤掉已经推送过的论文
+    unseen_papers = []
+    for p in raw_papers:
+        if p.get("paperId") in seen_papers:
+            continue
+            
+        abstract_text = (p.get("abstract") or "").strip()
+        if not abstract_text or len(abstract_text) < 50:  # 确保摘要有一定长度
+            continue
+            
+        unseen_papers.append(p)
+    
+    # 按发表日期倒序排列
+    def get_date(p):
+        pub_date = p.get("publicationDate")
+        if pub_date and pub_date != "未知日期":
+            return pub_date
+        year = p.get("year")
+        if year and year != "未知":
+            return f"{year}-12-31"
+        return "1900-01-01"
+    
+    unseen_papers.sort(key=get_date, reverse=True)
+    
+    # 只取前5篇最新的（测试阶段减少数量）
+    top_new_papers = unseen_papers[:5]
+    
+    print(f"过滤后得到 {len(top_new_papers)} 篇新论文")
+    return top_new_papers
+
+def generate_simple_summary(paper):
+    """生成简单的论文摘要（不调用LLM）"""
+    title = paper.get("title", "无标题")
+    abstract = paper.get("abstract", "无摘要")
+    
+    # 简单的关键词提取和总结
+    lines = []
+    
+    # 尝试提取研究问题
+    problem_keywords = ["problem", "challenge", "issue", "limitation", "gap", "address", "propose"]
+    problems = []
+    for keyword in problem_keywords:
+        if keyword.lower() in abstract.lower():
+            # 简单的上下文提取
+            sentences = re.split(r'[.!?]+', abstract)
+            for sent in sentences:
+                if keyword.lower() in sent.lower() and len(sent.strip()) > 20:
+                    problems.append(sent.strip())
+                    break
+    
+    lines.append(f"**[试图解决的问题]**：{problems[0] if problems else '该研究针对相关领域的技术挑战'}")
+    
+    # 尝试提取方法
+    method_keywords = ["method", "approach", "technique", "algorithm", "model", "framework", "propose"]
+    methods = []
+    for keyword in method_keywords:
+        if keyword.lower() in abstract.lower():
+            sentences = re.split(r'[.!?]+', abstract)
+            for sent in sentences:
+                if keyword.lower() in sent.lower() and len(sent.strip()) > 20:
+                    methods.append(sent.strip())
+                    break
+    
+    lines.append(f"**[核心方法]**：{methods[0] if methods else '提出了一种新的技术方案来解决相关问题'}")
+    
+    # 尝试提取结果
+    result_keywords = ["result", "improve", "performance", "accuracy", "outperform", "achieve", "demonstrate"]
+    results = []
+    for keyword in result_keywords:
+        if keyword.lower() in abstract.lower():
+            sentences = re.split(r'[.!?]+', abstract)
+            for sent in sentences:
+                if keyword.lower() in sent.lower() and len(sent.strip()) > 20:
+                    results.append(sent.strip())
+                    break
+    
+    lines.append(f"**[创新与效果]**：{results[0] if results else '实验结果显示该方法在相关任务上取得良好效果'}")
+    
+    return "\n".join(lines)
+
+def create_report_content(papers):
+    """创建报告内容（简化版本，不使用LLM）"""
+    if not papers:
+        return "今天没有发现新的相关论文。"
+    
+    report_content = f"# 📚 每日文献追踪晨报\n\n*生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n"
+    
+    for idx, paper in enumerate(papers):
+        title = paper.get("title", "无标题")
+        date = paper.get("publicationDate") or paper.get("year") or "未知日期"
+        abstract_text = (paper.get("abstract") or "")[:300] + "..." if len((paper.get("abstract") or "")) > 300 else (paper.get("abstract") or "无摘要")
+        
+        # 构建链接
+        url = paper.get("url", "#")
+        venue_name = paper.get("venue", "arXiv")
+        
+        authors_list = paper.get("authors", [])
+        authors = ", ".join([author.get("name", "未知") for author in authors_list[:3]])
+        if len(authors_list) > 3:
+            authors += ", et al."
+        
+        # 生成简单总结
+        summary = generate_simple_summary(paper)
+        
+        report_content += f"""## {idx+1}. [{title}]({url})
+*{venue_name}* | {authors} | {date}
+
+**摘要预览:** {abstract_text}
+
+{summary}
+
+---
+"""
+    
+    return report_content
+
+def update_history(papers):
+    """将已推送的论文 ID 追加到历史记录文件"""
+    if not papers:
+        return
+
+    os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+
+    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+        for p in papers:
+            f.write(p.get("paperId") + "\n")
+    print(f"已更新历史记录，新增 {len(papers)} 篇论文")
+
+def push_to_wechat(content):
+    """模拟微信推送（实际可以接入Server酱或其他服务）"""
+    print("=== 模拟微信推送 ===")
+    print(f"标题: 📚 你的每日文献追踪晨报到了！")
+    print(f"内容长度: {len(content)} 字符")
+    
+    # 如果是测试模式，可以选择是否真的发送
+    # 取消下面的注释来启用真实的Server酱推送（需要配置SERVERCHAN_KEY）
+    """
+    SERVERCHAN_KEY = os.getenv("SERVERCHAN_KEY")
+    if SERVERCHAN_KEY:
+        url = f"https://sctapi.ftqq.com/{SERVERCHAN_KEY}.send"
+        data = {"title": "📚 你的每日文献追踪晨报到了！", "desp": content}
+        try:
+            response = requests.post(url, data=data)
+            print(f"Server酱推送结果: {response.status_code}")
+        except Exception as e:
+            print(f"Server酱推送失败: {e}")
+    else:
+        print("未配置SERVERCHAN_KEY，跳过真实推送")
+    """
+    
+    # 总是写入文件以便查看结果
+    with open("daily_report.md", "w", encoding="utf-8") as f:
+        f.write(content)
+    print("报告已保存到 daily_report.md")
+
+if __name__ == "__main__":
+    print("🚀 开始运行文献追踪测试...")
+    
+    # 获取推荐论文
+    new_papers = get_paper_recommendations()
+    
+    if new_papers:
+        print(f"✅ 找到 {len(new_papers)} 篇最新论文")
+        
+        # 创建报告（不使用LLM）
+        report = create_report_content(new_papers)
+        
+        # 推送到微信（模拟）
+        push_to_wechat(report)
+        
+        # 更新历史记录
+        update_history(new_papers)
+        
+        print("🎉 全部完成！")
+    else:
+        print("📭 今天没有发现未读的最新相关文献。")
+EOF
+        
+    - name: Run test paper tracker (No API Keys)
+      env:
+        # 不设置API密钥，测试免费方案
+        # S2_API_KEY: ${{ secrets.S2_API_KEY }}  # 注释掉
+        # LLM_API_KEY: ${{ secrets.LLM_API_KEY }}  # 注释掉
+        # SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}  # 注释掉，使用模拟推送
+      run: |
+        python paper_tracker_test.py
+        
+    - name: Upload daily report as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: daily-report-${{ github.run_number }}
+        path: daily_report.md
+        retention-days: 7
+        
+    - name: Commit and push updated history
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        # 检查是否有更改
+        if [[ -n $(git status --porcelain config/seen_papers.txt) ]]; then
+          git add config/seen_papers.txt
+          git commit -m "Update seen papers history [skip ci]"
+          git push
+        else
+          echo "No changes to commit"
+        fi
