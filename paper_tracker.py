@@ -1,20 +1,9 @@
 import os
 import requests
-import time
 import xml.etree.ElementTree as ET
-import ssl
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
-# ================= 修复本地 SSL 和代理问题 =================
-# 强制使用 TLSv1.2+，并清除代理环境变量（解决 SSL 握手超时）
-ssl_context = ssl.create_default_context()
-ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-os.environ.pop('HTTP_PROXY', None)
-os.environ.pop('HTTPS_PROXY', None)
-os.environ.pop('http_proxy', None)
-os.environ.pop('https_proxy', None)
 
 # ================= 尝试导入 OpenAI =================
 try:
@@ -26,13 +15,9 @@ except ImportError:
     print("如需使用 AI 总结，请运行: pip install openai")
 
 # ================= 配置区 =================
-# OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY")   # OpenAlex API Key（可选）
-# LLM_API_KEY = os.getenv("LLM_API_KEY")             # DeepSeek API Key（可选，设置后启用 AI 总结）
-# SERVERCHAN_KEY = os.getenv("SERVERCHAN_KEY")       # Server酱 Key（必需）
-OPENALEX_API_KEY = "OjINwoZkV2WleUIGdNtL4p"
-SERVERCHAN_KEY = "SCT332237T0UXsNN41LShwFUlvaGRtFVPJ"
+OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY")
 LLM_API_KEY = os.getenv("LLM_API_KEY")
-
+SERVERCHAN_KEY = os.getenv("SERVERCHAN_KEY")
 
 HISTORY_FILE = "config/seen_papers.txt"
 DEBUG = True
@@ -42,11 +27,8 @@ def debug_print(msg):
         print(f"[DEBUG] {msg}")
 
 def create_session():
-    """创建带重试机制的 requests session，并应用代理和 SSL 配置"""
+    """创建带重试机制的 requests session（无本地 SSL 特殊处理）"""
     session = requests.Session()
-    # 使用自定义 SSL 上下文（修复本地 SSL 问题）
-    session.verify = False   # 临时禁用验证，若需要可改为 True 并使用 certifi
-    # 配置重试策略
     retry_strategy = Retry(
         total=3,
         backoff_factor=1,
@@ -57,7 +39,6 @@ def create_session():
     session.mount("http://", adapter)
     session.mount("https://", adapter)
 
-    # 添加 OpenAlex API Key（如果有）
     if OPENALEX_API_KEY:
         session.headers.update({"Authorization": f"Bearer {OPENALEX_API_KEY}"})
         debug_print("使用 API Key 调用 OpenAlex")
@@ -84,26 +65,37 @@ def read_seed_papers(file_path):
                 papers.append(line)
     return papers
 
-def get_work_id_from_input(paper_input):
+def fetch_work_by_id(session, paper_input):
+    """
+    获取论文详情，支持 DOI 或 OpenAlex ID。
+    paper_input 可以是 DOI（如 "10.1038/nn.4589"）或 OpenAlex ID（如 "W2625862723"）
+    """
+    # 判断输入类型
     if paper_input.startswith("10."):
-        return f"https://doi.org/{paper_input}"
-    elif paper_input.startswith("https://openalex.org/"):
-        return paper_input
+        url = f"https://api.openalex.org/works/doi/{paper_input}"
     elif paper_input.startswith("W"):
-        return f"https://openalex.org/{paper_input}"
+        url = f"https://api.openalex.org/works/{paper_input}"
+    elif paper_input.startswith("https://doi.org/"):
+        doi = paper_input.replace("https://doi.org/", "")
+        url = f"https://api.openalex.org/works/doi/{doi}"
+    elif paper_input.startswith("https://openalex.org/"):
+        url = paper_input
     else:
-        return f"https://doi.org/{paper_input}"
+        # 尝试作为 DOI
+        url = f"https://api.openalex.org/works/doi/{paper_input}"
 
-def fetch_work_by_id(session, paper_id):
-    url = f"https://api.openalex.org/works/{paper_id}"
     params = {
         "select": "id,title,abstract_inverted_index,doi,publication_date,publication_year,host_venue,primary_location,cited_by_count,related_works"
     }
+    debug_print(f"请求 URL: {url}")
     try:
         resp = session.get(url, params=params, timeout=30)
-        return resp.json() if resp.status_code == 200 else None
+        if resp.status_code != 200:
+            debug_print(f"获取论文失败，状态码 {resp.status_code}: {resp.text[:200]}")
+            return None
+        return resp.json()
     except Exception as e:
-        debug_print(f"获取论文失败: {e}")
+        debug_print(f"请求异常: {e}")
         return None
 
 def find_by_related_works(session, seed_work, limit=10):
@@ -119,24 +111,35 @@ def find_by_related_works(session, seed_work, limit=10):
 
 def find_by_semantic_search(session, seed_work, limit=10):
     debug_print("正在通过语义搜索查找相关文献...")
-    search_text = seed_work.get("abstract", "") or seed_work.get("title", "")
+    # 获取搜索文本：优先摘要，无则标题
+    search_text = seed_work.get("abstract", "")
+    if not search_text:
+        # 从倒排索引还原摘要（如果有）
+        inverted = seed_work.get("abstract_inverted_index")
+        if inverted:
+            search_text = undo_inverted_index(inverted)
+    if not search_text:
+        search_text = seed_work.get("title", "")
     search_text = search_text[:500].strip()
     if not search_text:
+        debug_print("无法获取搜索文本")
         return []
     url = "https://api.openalex.org/works"
     params = {
         "search": search_text,
         "per-page": limit,
         "sort": "relevance",
-        "select": "id,title,abstract_inverted_index,authorships,doi,publication_date,publication_year,host_venue,primary_location,cited_by_count,related_works"
+        "select": "id,title,abstract_inverted_index,authorships,doi,publication_date,publication_year,host_venue,primary_location,cited_by_count"
     }
     try:
         resp = session.get(url, params=params, timeout=30)
         if resp.status_code != 200:
+            debug_print(f"语义搜索失败: {resp.status_code}")
             return []
         results = resp.json().get("results", [])
         seed_id = seed_work.get("id", "")
         filtered = [p for p in results if p.get("id") != seed_id]
+        debug_print(f"语义搜索找到 {len(filtered)} 篇相关论文")
         return filtered[:limit]
     except Exception as e:
         debug_print(f"语义搜索异常: {e}")
@@ -145,12 +148,13 @@ def find_by_semantic_search(session, seed_work, limit=10):
 def fetch_works_batch(session, work_ids):
     if not work_ids:
         return []
+    # work_ids 是 OpenAlex 的完整 URL 列表（如 ['https://openalex.org/W123']）
     ids_str = "|".join([wid.split("/")[-1] for wid in work_ids])
     url = "https://api.openalex.org/works"
     params = {
         "filter": f"openalex_id:{ids_str}",
         "per-page": len(work_ids),
-        "select": "id,title,abstract_inverted_index,authorships,doi,publication_date,publication_year,host_venue,primary_location,cited_by_count,related_works"
+        "select": "id,title,abstract_inverted_index,authorships,doi,publication_date,publication_year,host_venue,primary_location,cited_by_count"
     }
     try:
         resp = session.get(url, params=params, timeout=30)
@@ -276,8 +280,7 @@ def get_paper_recommendations():
     all_papers = []
     for seed_input in seed_papers[:1]:
         print(f"\n处理种子论文: {seed_input}")
-        work_id = get_work_id_from_input(seed_input)
-        seed_work = fetch_work_by_id(session, work_id)
+        seed_work = fetch_work_by_id(session, seed_input)
         if not seed_work:
             print(f"无法获取种子论文: {seed_input}")
             continue
