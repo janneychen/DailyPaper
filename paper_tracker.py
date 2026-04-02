@@ -5,7 +5,7 @@ from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ================= 尝试导入 OpenAI =================
+# --- 尝试导入 OpenAI（如果安装了的话）---
 try:
     from openai import OpenAI
     OPENAI_AVAILABLE = True
@@ -14,7 +14,7 @@ except ImportError:
     print("警告：未安装 openai 库，AI 总结功能将不可用")
     print("如需使用 AI 总结，请运行: pip install openai")
 
-# ================= 配置区 =================
+# --- 配置区 ---
 OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY")
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 SERVERCHAN_KEY = os.getenv("SERVERCHAN_KEY")
@@ -27,8 +27,8 @@ def debug_print(msg):
         print(f"[DEBUG] {msg}")
 
 def create_session():
-    """创建带重试机制的 requests session（无本地 SSL 特殊处理）"""
     session = requests.Session()
+    # 配置重试策略
     retry_strategy = Retry(
         total=3,
         backoff_factor=1,
@@ -68,7 +68,6 @@ def read_seed_papers(file_path):
 def fetch_work_by_id(session, paper_input):
     """
     获取论文详情，支持 DOI 或 OpenAlex ID。
-    paper_input 可以是 DOI（如 "10.1038/nn.4589"）或 OpenAlex ID（如 "W2625862723"）
     """
     # 判断输入类型
     if paper_input.startswith("10."):
@@ -81,11 +80,11 @@ def fetch_work_by_id(session, paper_input):
     elif paper_input.startswith("https://openalex.org/"):
         url = paper_input
     else:
-        # 尝试作为 DOI
         url = f"https://api.openalex.org/works/doi/{paper_input}"
 
+    # 有效字段列表（移除 host_venue）
     params = {
-        "select": "id,title,abstract_inverted_index,doi,publication_date,publication_year,host_venue,primary_location,cited_by_count,related_works"
+        "select": "id,title,abstract_inverted_index,doi,publication_date,publication_year,primary_location,cited_by_count,related_works"
     }
     debug_print(f"请求 URL: {url}")
     try:
@@ -97,6 +96,26 @@ def fetch_work_by_id(session, paper_input):
     except Exception as e:
         debug_print(f"请求异常: {e}")
         return None
+
+def fetch_works_batch(session, work_ids):
+    if not work_ids:
+        return []
+    ids_str = "|".join([wid.split("/")[-1] for wid in work_ids])
+    url = "https://api.openalex.org/works"
+    params = {
+        "filter": f"openalex_id:{ids_str}",
+        "per-page": len(work_ids),
+        "select": "id,title,abstract_inverted_index,doi,publication_date,publication_year,primary_location,cited_by_count,related_works"
+    }
+    try:
+        resp = session.get(url, params=params, timeout=30)
+        if resp.status_code != 200:
+            debug_print(f"批量查询失败，状态码 {resp.status_code}: {resp.text[:200]}")
+            return []
+        return resp.json().get("results", [])
+    except Exception as e:
+        debug_print(f"批量查询异常: {e}")
+        return []
 
 def find_by_related_works(session, seed_work, limit=10):
     debug_print("正在通过 related_works 查找相关文献...")
@@ -111,56 +130,30 @@ def find_by_related_works(session, seed_work, limit=10):
 
 def find_by_semantic_search(session, seed_work, limit=10):
     debug_print("正在通过语义搜索查找相关文献...")
-    # 获取搜索文本：优先摘要，无则标题
-    search_text = seed_work.get("abstract", "")
-    if not search_text:
-        # 从倒排索引还原摘要（如果有）
-        inverted = seed_work.get("abstract_inverted_index")
-        if inverted:
-            search_text = undo_inverted_index(inverted)
+    search_text = seed_work.get("abstract_inverted_index") and " " or seed_work.get("title", "")
     if not search_text:
         search_text = seed_work.get("title", "")
     search_text = search_text[:500].strip()
     if not search_text:
-        debug_print("无法获取搜索文本")
         return []
     url = "https://api.openalex.org/works"
     params = {
         "search": search_text,
         "per-page": limit,
         "sort": "relevance",
-        "select": "id,title,abstract_inverted_index,authorships,doi,publication_date,publication_year,host_venue,primary_location,cited_by_count"
+        "select": "id,title,abstract_inverted_index,doi,publication_date,publication_year,primary_location,cited_by_count,related_works"
     }
     try:
         resp = session.get(url, params=params, timeout=30)
         if resp.status_code != 200:
-            debug_print(f"语义搜索失败: {resp.status_code}")
+            debug_print(f"语义搜索失败，状态码 {resp.status_code}: {resp.text[:200]}")
             return []
         results = resp.json().get("results", [])
         seed_id = seed_work.get("id", "")
         filtered = [p for p in results if p.get("id") != seed_id]
-        debug_print(f"语义搜索找到 {len(filtered)} 篇相关论文")
         return filtered[:limit]
     except Exception as e:
         debug_print(f"语义搜索异常: {e}")
-        return []
-
-def fetch_works_batch(session, work_ids):
-    if not work_ids:
-        return []
-    # work_ids 是 OpenAlex 的完整 URL 列表（如 ['https://openalex.org/W123']）
-    ids_str = "|".join([wid.split("/")[-1] for wid in work_ids])
-    url = "https://api.openalex.org/works"
-    params = {
-        "filter": f"openalex_id:{ids_str}",
-        "per-page": len(work_ids),
-        "select": "id,title,abstract_inverted_index,authorships,doi,publication_date,publication_year,host_venue,primary_location,cited_by_count"
-    }
-    try:
-        resp = session.get(url, params=params, timeout=30)
-        return resp.json().get("results", []) if resp.status_code == 200 else []
-    except Exception as e:
-        debug_print(f"批量查询异常: {e}")
         return []
 
 def undo_inverted_index(inverted_index):
@@ -244,10 +237,10 @@ def convert_to_standard_format(openalex_paper):
     year = pub_date[:4] if pub_date else openalex_paper.get("publication_year", "")
     # 提取会议/期刊
     venue = ""
-    if openalex_paper.get("host_venue"):
-        venue = openalex_paper["host_venue"].get("display_name", "")
-    elif openalex_paper.get("primary_location"):
-        venue = openalex_paper["primary_location"].get("source", {}).get("display_name", "")
+    primary_loc = openalex_paper.get("primary_location", {})
+    source = primary_loc.get("source", {})
+    if source:
+        venue = source.get("display_name", "")
     # 获取摘要：优先使用倒排索引还原，若为空则尝试 PubMed
     abstract = ""
     inverted = openalex_paper.get("abstract_inverted_index")
@@ -302,7 +295,6 @@ def get_paper_recommendations():
     return final
 
 def format_papers_simple(papers):
-    """简单格式化论文信息（不调用 LLM）"""
     report = ""
     for idx, paper in enumerate(papers, 1):
         title = paper.get("title", "无标题")
@@ -334,7 +326,6 @@ def format_papers_simple(papers):
     return report
 
 def summarize_papers_with_llm(papers):
-    """调用大模型进行总结，如果 LLM_API_KEY 已设置且 openai 库可用，则使用 AI 总结，否则使用简单格式"""
     if not LLM_API_KEY:
         print("未设置 LLM_API_KEY，使用简单格式推送...")
         return format_papers_simple(papers)
